@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import sys
 import os
 import argparse 
@@ -5,8 +6,11 @@ import zipfile
 import tempfile
 import random
 import logging
-import xml.etree.ElementTree as ET
 from datetime import datetime, date
+try:
+    import xml.etree.cElementTree as ET
+except ImportError:
+    import xml.etree.ElementTree as ET
 
 
 FORMAT = '%(asctime)-15s %(levelname)s %(message)s'
@@ -15,13 +19,11 @@ logger = logging.getLogger('apple_health')
 logger.setLevel(logging.DEBUG)
 
 
-def process_data_files(exportfile, cdafile):
-    logger.info(f"Processing Export File {exportfile}")
-    print()
-    print("start_date,end_date,observation_time,hr_bpm")
-    tree = ET.parse(exportfile)
-    root = tree.getroot()  
-
+def process_record(args, node, start = None, end = None):
+    ''' Process record contained in node, if it is between start and end '''
+    if 'type' not in node.attrib:
+        #warning?
+        return None
     # Extract 1
     # Extract first order HR observations
     # https://developer.apple.com/documentation/healthkit/hkquantitytypeidentifier/2881127-heartratevariabilitysdnn
@@ -59,52 +61,115 @@ def process_data_files(exportfile, cdafile):
        <InstantaneousBeatsPerMinute bpm="93" time="6:14:50.88 PM"/>
     '''
 
+    # Apply filters
+    if 'sourceName' in node.attrib:
+        sourceName = node.attrib['sourceName']
+    else:
+        sourceName = ''
+    if 'device' in node.attrib:
+        device = node.attrib['device']
+    else:
+        device = ''
+    if args.device and args.device != device:
+        return None
+    if args.sourceName and args.sourceName != sourceName:
+        return None
+
+    st = node.attrib['startDate']
+    ed = node.attrib['endDate']
+    # filter time range
+    if start and end:
+        start_ = datetime.strptime(st, '%Y-%m-%d %H:%M:%S %z')
+        end_ = datetime.strptime(ed, '%Y-%m-%d %H:%M:%S %z')
+        if start < start_ and end < end_:
+            return None
+        if start > start_ and end > end_:
+            return None
+
+    if node.attrib['type']=='HKQuantityTypeIdentifierHeartRate':
+        if 'value' in node.attrib:
+            bpm = node.attrib['value']
+            if not args.summary:
+                print(f"{st},{ed},,{bpm}", file=args.outfile)
+                #print(f"{st},{bpm},{ed},{sourceName},{device}")
+
+    elif node.attrib['type']=='HKQuantityTypeIdentifierHeartRateVariabilitySDNN':
+
+        seq_st = node.attrib['startDate']
+        seq_ed = node.attrib['endDate']
+        seq_st_dt = datetime.strptime(seq_st, '%Y-%m-%d %H:%M:%S %z')
+
+        grandchildren = node.iter()
+        obs_first = None
+        for gc in grandchildren:
+            if gc.tag == 'InstantaneousBeatsPerMinute':
+                if not obs_first:
+                    obs_first = gc.attrib['time']
+                    st_dt = datetime.strptime(obs_first, '%H:%M:%S.%f %p')
+                            
+                if 'bpm' in gc.attrib:
+                    bpm = gc.attrib['bpm']
+
+                    # Derive elapsed time offset within observation series
+                    tm = gc.attrib['time']
+                    ed_dt = datetime.strptime(tm, '%H:%M:%S.%f %p')
+                    time_offset = datetime.combine(date.min, ed_dt.time()) - datetime.combine(date.min, st_dt.time())
+
+                    # Apply elapsed time offset to sequence start time
+                    seq_st_dt_plusdelta = seq_st_dt+time_offset
+
+                    if not args.summary:
+                        print(f"{seq_st_dt_plusdelta},{bpm},{sourceName},{device}", file=args.outfile)
+                        #print(f"{st},{ed},{time_offset},{bpm}")
+                        #print(f"{seq_st},{seq_ed},{tm},{time_offset},{seq_st_dt_plusdelta},{bpm}")
+
+    return (sourceName, node.attrib['type'])
+
+def process_workout(args, node, root, index):
+    st = node.attrib['startDate']
+    ed = node.attrib['endDate']
+    ty = node.attrib['workoutActivityType']
+    start_ = datetime.strptime(st, '%Y-%m-%d %H:%M:%S %z')
+    end_ = datetime.strptime(ed, '%Y-%m-%d %H:%M:%S %z')
+    print(f'# [{index}] : {ty} : {st} - {ed}', file=args.outfile)
+    if not args.summary:
+        for child in root.iter():
+            #print(node.tag)
+            if child.tag == 'Record':
+                #print(node.tag)
+                process_record(args, child, start_, end_)
+
+def process_data_files(args, exportfile, cdafile):
+    logger.info(f"Processing Export File {exportfile}")
+    print(file=args.outfile)
+    print("start_date,end_date,observation_time,hr_bpm", file=args.outfile)
+    tree = ET.parse(exportfile)
+    root = tree.getroot()  
+
+    record_types = {}
+    workout_idx = 0
+
     for child in root.iter():
         #print(child.tag)
         if child.tag == 'Record':
             #print(child.tag)
-            if 'type' in child.attrib:
+            if not args.workout:
+                rt = process_record(args, child)
+                if rt in record_types:
+                    record_types[rt] = record_types[rt] + 1
+                else:
+                    record_types[rt] = 1
+        elif child.tag == 'Workout':
+            workout_idx = workout_idx + 1
+            if args.workout and args.workout == workout_idx or args.summary:
+                process_workout(args, child, root, workout_idx)
 
-                if child.attrib['type']=='HKQuantityTypeIdentifierHeartRate':
-                    if 'value' in child.attrib:
-                        st = child.attrib['startDate']
-                        ed = child.attrib['endDate']
-                        bpm = child.attrib['value']
-                        #print(f"{st},{ed},,{bpm}")
-                        print(f"{st},{bpm}")
-
-                elif child.attrib['type']=='HKQuantityTypeIdentifierHeartRateVariabilitySDNN':
-
-                    seq_st = child.attrib['startDate']
-                    seq_ed = child.attrib['endDate']
-
-                    seq_st_dt = datetime.strptime(seq_st, '%Y-%m-%d %H:%M:%S %z')
-
-                    grandchildren = child.iter()
-                    obs_first = None
-                    for gc in grandchildren:
-                        if gc.tag == 'InstantaneousBeatsPerMinute':
-                            if not obs_first:
-                                obs_first = gc.attrib['time']
-                                st_dt = datetime.strptime(obs_first, '%H:%M:%S.%f %p')
-                            
-                            if 'bpm' in gc.attrib:
-                                bpm = gc.attrib['bpm']
-
-                                # Derive elapsed time offset within observation series
-                                tm = gc.attrib['time']
-                                ed_dt = datetime.strptime(tm, '%H:%M:%S.%f %p')
-                                time_offset = datetime.combine(date.min, ed_dt.time()) - datetime.combine(date.min, st_dt.time())
-
-                                # Apply elapsed time offset to sequence start time
-                                seq_st_dt_plusdelta = seq_st_dt+time_offset
-
-                                print(f"{seq_st_dt_plusdelta},{bpm}")
-                                #print(f"{st},{ed},{time_offset},{bpm}")
-                                #print(f"{seq_st},{seq_ed},{tm},{time_offset},{seq_st_dt_plusdelta},{bpm}")
+    if args.summary:
+        for k,v in record_types.items():
+            print(f"# {v:6} Records from sourceName: {k[0]:16} type: {k[1]}", file=args.outfile)
     return True
 
-def prep_and_process_files(infile, indir):
+def prep_and_process_files(args, infile, indir):
     if infile and indir:
         logger.error("Cannot have both an input file to extract and also a ready-extracted data dir")
         raise Exception("Cannot have both an input file to extract and also a ready-extracted data dir")
@@ -153,7 +218,7 @@ def prep_and_process_files(infile, indir):
                 logger.error(f"Bad input file received, missing key file export.xml")
                 raise Exception(f"Bad input file received, missing key file export.xml")
 
-            return process_data_files(keyfile2, keyfile1)
+            return process_data_files(args, keyfile2, keyfile1)
 
 
     if indir:
@@ -176,13 +241,19 @@ def prep_and_process_files(infile, indir):
             logger.error(f"Bad input file received, missing key file export.xml")
             raise Exception(f"Bad input file received, missing key file export.xml")
 
-        return process_data_files(keyfile2, keyfile1)
+        return process_data_files(args, keyfile2, keyfile1)
 
 def main():
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('--outfile', help='Path to output csv, default ./out.csv',
+                        type=argparse.FileType('r'))
     parser.add_argument('--infile', help='Path to Apple Health extract zipball')
     parser.add_argument('--datadir', help='Path to Apple Health extracted files')
+    parser.add_argument('--device', help='Filter records by device')
+    parser.add_argument('--workout', help='Filter records by workout', type=int)
+    parser.add_argument('--sourceName', help='Filter records by sourceName')
+    parser.add_argument('--summary', help='Just print summary of what is in the export', action='store_true')
 
     args = parser.parse_args()
 
@@ -197,11 +268,15 @@ def main():
         data_dir = args.datadir
         logger.info(f"Path to readily available data: {data_dir}")
 
-    prep_and_process_files(input_file, data_dir)
-  
+    if not args.outfile:
+        if args.summary:
+            args.outfile = sys.stdout
+        else:
+            args.outfile = open('out.csv', 'w')
+
+    prep_and_process_files(args, input_file, data_dir)
+
 if __name__== "__main__":
-
-
 
     headline = r"""
                            _        _    _            _ _   _              
@@ -218,9 +293,9 @@ if __name__== "__main__":
                                                                            
     """   
 
-    print()
-    print(headline)
-    print("(c) 2019 Saif Ahmed")
+    #print()
+    #print(headline)
+    #print("(c) 2019 Saif Ahmed")
     print()                                                                    
 
     main()
